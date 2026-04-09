@@ -2,6 +2,13 @@
 
 Reference: https://www.ibm.com/docs/en/storage-scale/6.0.0?topic=rules-policy-syntax
 
+## Important: Filesystem Context
+
+**CRITICAL**: When a user mentions a filesystem (e.g., "filesystem fs1"), they are specifying which storage filesystem to operate on, NOT a path filter. The filesystem context is determined by where the policy is applied, not by adding PATH_NAME conditions.
+
+**DO NOT** add `PATH_NAME LIKE '/filesystem_name/%'` unless the user explicitly requests filtering by a specific directory path within the filesystem.
+
+
 ## File Migration Rule Syntax
 
 ```
@@ -104,12 +111,12 @@ RULE 'migrate_old_logs' MIGRATE TO POOL 'archive' WHERE (DAYS(CURRENT_TIMESTAMP)
 RULE 'migrate_large_videos' MIGRATE TO POOL 'capacity' WHERE (KB_ALLOCATED > 10485760) AND (lower(NAME) LIKE '%.mp4' OR lower(NAME) LIKE '%.avi' OR lower(NAME) LIKE '%.mov')
 ```
 
-### Example 6: Delete temporary files older than 30 days
+### Example 6: Delete temporary files older than 30 days from /tmp directory
 ```
 RULE 'delete_temp' DELETE FROM POOL 'system' WHERE (DAYS(CURRENT_TIMESTAMP) - DAYS(ACCESS_TIME) > 30) AND (lower(NAME) LIKE '%.tmp' OR PATH_NAME LIKE '%/tmp/%')
 ```
 
-### Example 7: Migrate files from specific directory
+### Example 7: Migrate files from specific directory path
 ```
 RULE 'migrate_archive_dir' MIGRATE TO POOL 'archive' WHERE PATH_NAME LIKE '%/archive/%'
 ```

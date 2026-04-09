@@ -104,6 +104,9 @@ class ILMWorkflowState(TypedDict):
     test_passed: bool
     policy_updated: bool
     
+    # Migration results
+    migration_stats: Optional[Dict[str, Any]]  # Statistics from apply_policy execution
+
     # Error tracking
     error_message: Optional[str]
     
@@ -136,6 +139,7 @@ def create_initial_state() -> ILMWorkflowState:
         policy_tested=False,
         test_passed=False,
         policy_updated=False,
+        migration_stats=None,
         error_message=None,
         last_user_message=None,
     )
@@ -397,6 +401,17 @@ def _get_workflow_guidance(state: ILMWorkflowState) -> str:
     
     # Workflow completed - inform user and stop
     if step == "completed":
+        # Check if we have migration statistics to report
+        migration_stats = state.get("migration_stats")
+        if migration_stats:
+            stats_summary = _format_migration_stats(migration_stats)
+            return (
+                f"AGENT INSTRUCTION: Workflow completed successfully.\n\n"
+                f"MIGRATION RESULTS:\n{stats_summary}\n\n"
+                f"Present these results clearly to the user. DO NOT call any more tools. "
+                f"The task is finished."
+            )
+
         return (
             "AGENT INSTRUCTION: Workflow completed successfully. "
             "Present the results to the user and DO NOT call any more tools. "
@@ -404,6 +419,29 @@ def _get_workflow_guidance(state: ILMWorkflowState) -> str:
         )
     
     return ""
+
+
+def _format_migration_stats(stats: Dict[str, Any]) -> str:
+    """Format migration statistics for user-friendly display."""
+    lines = []
+
+    if "files_processed" in stats:
+        files_count = stats["files_processed"]
+        if files_count > 0:
+            lines.append(f"✓ Successfully processed {files_count} file(s)")
+        else:
+            lines.append("⚠ No files were processed (0 files matched the policy criteria)")
+
+    if "files_chosen" in stats and "total_candidates" in stats:
+        lines.append(f"  - {stats['files_chosen']} of {stats['total_candidates']} candidate files were selected")
+
+    if "files_dispatched" in stats:
+        lines.append(f"  - {stats['files_dispatched']} file(s) dispatched for processing")
+
+    if "files_skipped" in stats and stats["files_skipped"] > 0:
+        lines.append(f"⚠ {stats['files_skipped']} file(s) skipped or encountered errors")
+
+    return "\n".join(lines) if lines else "Policy applied successfully"
 
 
 def _parse_tool_content(tool_content: Any) -> Dict[str, Any]:
@@ -431,6 +469,9 @@ def _check_tool_error(tool_result: Dict[str, Any], tool_name: str) -> tuple[bool
 
     Detects errors from multiple sources by checking for common error keywords
     in various fields of the response. Also detects cancellation as an error.
+
+    IMPORTANT: Respects explicit success indicators (status="success", exit_code=0)
+    before checking for error keywords in output text.
     """
     if not isinstance(tool_result, dict):
         return False, None
@@ -447,7 +488,16 @@ def _check_tool_error(tool_result: Dict[str, Any], tool_name: str) -> tuple[bool
         logger.warning(f"Tool {tool_name} returned isError=true: {error_message}")
         return True, str(error_message)
 
-    # Check all text fields for error keywords
+    # CRITICAL: Check for explicit success indicators before checking error keywords
+    # If status is "success" or exit_code is 0, don't treat informational messages as errors
+    status = tool_result.get("status", "").lower()
+    exit_code = tool_result.get("exit_code")
+
+    if status == "success" or exit_code == 0:
+        logger.debug(f"Tool {tool_name} has explicit success indicator (status={status}, exit_code={exit_code})")
+        return False, None
+
+    # Check all text fields for error keywords (only if no explicit success)
     for field in ERROR_CHECK_FIELDS:
         field_value = str(tool_result.get(field, "")).lower()
         if field_value and any(keyword in field_value for keyword in ERROR_KEYWORDS):
@@ -474,6 +524,7 @@ def _check_success_status(tool_result: Any) -> bool:
     if isinstance(tool_result, dict):
         # Success = no error detected
         is_error, _ = _check_tool_error(tool_result, "check_success")
+        logger.debug(f"Tool check_success has explicit success indicator (status={tool_result.get('status')}, exit_code={tool_result.get('exit_code')})")
         return not is_error
 
     # For non-dict results, check string representation for error keywords
@@ -519,7 +570,7 @@ def _process_get_policy_result(state: ILMWorkflowState, tool_result: Dict[str, A
     if state["workflow_step"] != "initial":
         updates["workflow_step"] = "generate_rule"
     
-    logger.debug(f"Policy retrieved for filesystem: {updates.get('filesystem')}")
+    logger.info(f"Policy retrieved for filesystem: {updates.get('filesystem')}")
     return updates
 
 
@@ -537,7 +588,7 @@ def _process_list_storage_pools_result(state: ILMWorkflowState, tool_result: Dic
             # Only advance workflow if in modification mode - move to validate_rule after pools verified
             if state["workflow_step"] != "initial":
                 updates["workflow_step"] = "validate_rule"
-                logger.debug(f"Storage pools verified: {pool_names}. Moving to rule validation.")
+                logger.info(f"Storage pools verified: {pool_names}. Moving to rule validation.")
             else:
                 logger.debug(f"Storage pools retrieved: {pool_names} (read-only request)")
         else:
@@ -566,10 +617,10 @@ def _process_test_policy_result(state: ILMWorkflowState, tool_result: Dict[str, 
         # If user explicitly requested testing only, complete the workflow
         if has_testing_intent:
             updates["workflow_step"] = "completed"
-            logger.debug("Policy test PASSED - completing workflow (testing intent detected)")
+            logger.info("Policy test PASSED - completing workflow (testing intent detected)")
         else:
             updates["workflow_step"] = "update_policy"
-            logger.debug("Policy test PASSED - ready for update")
+            logger.info("Policy test PASSED - ready for update")
     elif not test_passed:
         updates["error_message"] = "Policy test failed - please fix errors before updating"
         logger.warning("Policy test FAILED")
@@ -594,13 +645,13 @@ def _process_update_policy_result(state: ILMWorkflowState, tool_result: Dict[str
         wants_to_skip_apply = any(kw in user_request_lower for kw in skip_apply_keywords)
         
         if wants_to_skip_apply:
-            logger.debug("Policy updated successfully - completing workflow (skip apply intent detected)")
+            logger.info("Policy updated successfully - completing workflow (skip apply intent detected)")
             return {
                 "policy_updated": True,
                 "workflow_step": "completed",
             }
         else:
-            logger.debug("Policy updated successfully - proceeding to apply (default behavior)")
+            logger.info("Policy updated successfully - proceeding to apply (default behavior)")
             return {
                 "policy_updated": True,
                 "workflow_step": "apply_policy",
@@ -611,11 +662,75 @@ def _process_update_policy_result(state: ILMWorkflowState, tool_result: Dict[str
 
 
 def _process_apply_policy_result(tool_result: Dict[str, Any]) -> Dict[str, Any]:
-    """Process apply_policy tool result."""
+    """Process apply_policy tool result and extract migration statistics."""
     if _check_success_status(tool_result):
         logger.info("Policy applied successfully - workflow complete")
-        return {"workflow_step": "completed"}
+
+        # Extract migration statistics from the output
+        migration_stats = _extract_migration_stats(tool_result)
+
+        # Add migration statistics to the result if available
+        # IMPORTANT: Clear any previous error message on successful completion
+        result = {
+            "workflow_step": "completed",
+            "error_message": None  # Clear any previous errors
+        }
+        if migration_stats:
+            result["migration_stats"] = migration_stats
+            logger.info(f"Migration statistics: {migration_stats}")
+
+        return result
     return {}
+
+
+def _extract_migration_stats(tool_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract migration statistics from apply_policy output.
+
+    Parses the mmapplypolicy output to find:
+    - Number of files migrated/processed
+    - Number of files chosen for migration
+    - Any errors or skipped files
+    """
+    import re
+
+    # Get the output text from various possible fields
+    output_text = ""
+    for field in ["text", "output", "result", "message"]:
+        if field in tool_result:
+            output_text = str(tool_result[field])
+            break
+
+    if not output_text:
+        return None
+
+    stats = {}
+
+    # Pattern: "A total of X files have been migrated, deleted or processed"
+    total_pattern = r"A total of (\d+) files? have been migrated, deleted or processed"
+    total_match = re.search(total_pattern, output_text, re.IGNORECASE)
+    if total_match:
+        stats["files_processed"] = int(total_match.group(1))
+
+    # Pattern: "Chose to migrate XKB: Y of Z candidates"
+    chosen_pattern = r"Chose to migrate \d+KB: (\d+) of (\d+) candidates"
+    chosen_match = re.search(chosen_pattern, output_text, re.IGNORECASE)
+    if chosen_match:
+        stats["files_chosen"] = int(chosen_match.group(1))
+        stats["total_candidates"] = int(chosen_match.group(2))
+
+    # Pattern: "X 'skipped' files and/or errors"
+    skipped_pattern = r"(\d+) 'skipped' files and/or errors"
+    skipped_match = re.search(skipped_pattern, output_text, re.IGNORECASE)
+    if skipped_match:
+        stats["files_skipped"] = int(skipped_match.group(1))
+
+    # Pattern: "X files dispatched" (last occurrence is the final count)
+    dispatched_pattern = r"(\d+) files dispatched"
+    dispatched_matches = re.findall(dispatched_pattern, output_text, re.IGNORECASE)
+    if dispatched_matches:
+        stats["files_dispatched"] = int(dispatched_matches[-1])
+
+    return stats if stats else None
 
 
 def _process_tool_results(state: ILMWorkflowState, result: Dict[str, Any]) -> Dict[str, Any]:

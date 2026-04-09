@@ -154,6 +154,7 @@ def setup_logging(
     log_format: str = "json",
     max_bytes: int = 10485760,
     backup_count: int = 5,
+    console_level: Optional[str] = None,
 ) -> logging.Logger:
     """Setup logging based on configuration.
     
@@ -161,16 +162,23 @@ def setup_logging(
     will not create duplicate handlers.
 
     Args:
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_level: Logging level for file handler (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_file: Path to log file
         log_format: Format type ('json' or 'text')
         max_bytes: Maximum size of log file before rotation in bytes
         backup_count: Number of backup files to keep
+        console_level: Logging level for console handler (defaults to INFO to reduce clutter)
 
     Returns:
         Configured logger instance
     """
     log_level_value = getattr(logging, log_level.upper(), logging.INFO)
+
+    # Console defaults to INFO to avoid DEBUG clutter, unless explicitly set
+    if console_level is None:
+        console_level_value = logging.INFO
+    else:
+        console_level_value = getattr(logging, console_level.upper(), logging.INFO)
 
     if log_format == "json":
         formatter = logging.Formatter(
@@ -180,20 +188,23 @@ def setup_logging(
         formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(log_level_value)
+    # Set root logger to the lowest level (DEBUG) to capture everything
+    # Individual handlers will filter based on their own levels
+    root_logger.setLevel(logging.DEBUG)
     
     # Only setup handlers once (on first call)
     if not root_logger.handlers:
-        # Suppress noisy third-party loggers: use the configured level but no lower than WARNING
-        third_party_level = max(log_level_value, logging.WARNING)
-        logging.getLogger("httpx").setLevel(third_party_level)
-        logging.getLogger("httpcore").setLevel(third_party_level)
+        # Suppress noisy third-party loggers: use WARNING level
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+        # Console handler: defaults to INFO to reduce clutter
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level_value)
+        console_handler.setLevel(console_level_value)
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
+        # File handler: uses configured log_level (typically DEBUG for full details)
         if log_file:
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,12 +233,17 @@ def setup_agent_logging(config: configparser.ConfigParser, default_log_path: str
     logging_config = config["logging"] if "logging" in config else {}
     # Use shared log_path for all agents, fall back to default_log_path if not found
     shared_log_path = logging_config.get("log_path", default_log_path)
+
+    # Get console_level from config, default to INFO to reduce console clutter
+    console_level = logging_config.get("console_level", "INFO")
+
     setup_logging(
-        log_level=logging_config.get("level", "INFO"),
+        log_level=logging_config.get("level", "DEBUG"),  # File gets DEBUG for full details
         log_file=shared_log_path,
         log_format=logging_config.get("format", "json"),
         max_bytes=int(logging_config.get("max_bytes", "10485760")),
         backup_count=int(logging_config.get("backup_count", "5")),
+        console_level=console_level,  # Console gets INFO by default
     )
 
 
